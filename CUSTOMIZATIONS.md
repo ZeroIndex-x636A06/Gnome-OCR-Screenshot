@@ -19,5 +19,5 @@ This branch is based on upstream commit `c3c88ae`. It holds the version installe
 ## Removed compared with upstream
 
 This version was a trimmed rewrite, so it drops these upstream features: QR code
-decoding (pyzbar), syslog logging, `--enable-saving`, `--save-location` and
-`--no-close-on-action`. Only `--lang` remains.
+decoding (pyzbar), syslog logging, `--enablesaving`, `--save-location` and
+`--nocloseonaction`. Only `--lang` remains.
