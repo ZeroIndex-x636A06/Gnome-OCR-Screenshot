@@ -2,8 +2,10 @@
 
 import gi
 import os
+import signal
 import subprocess
 import threading
+import time
 
 try:
     from PIL import Image, ImageEnhance
@@ -41,6 +43,34 @@ except OSError:
 
 _NON_LANG = {"osd", "equ"}
 
+# Speak button: text goes to Speech Dispatcher (spd-say). With the Piper module in
+# extras/speech-dispatcher/piper-generic.conf, one utterance is a shell that runs
+# Piper into TTS_WAV and then plays it with pw-play.
+TTS_WAV = "/tmp/piper_tts.wav"
+# The module's shell; it lives from synthesis until playback ends.
+TTS_JOB_PATTERN = f"TMPWAV={TTS_WAV}"
+# Piper and pw-play; signalled to pause, resume and stop.
+TTS_PROC_PATTERN = f"^([^ ]*/)?(piper|pw-play) .*{TTS_WAV}"
+TTS_START_TIMEOUT = 10  # seconds for speech-dispatcher to start the utterance
+
+
+def _tts_running():
+    return subprocess.run(
+        ["pgrep", "-f", TTS_JOB_PATTERN], capture_output=True
+    ).returncode == 0
+
+
+def _tts_signal(sig):
+    subprocess.run(
+        ["pkill", f"-{sig.name[3:]}", "-f", TTS_PROC_PATTERN], capture_output=True
+    )
+
+
+def stop_speech():
+    subprocess.run(["spd-say", "-C"], capture_output=True)
+    _tts_signal(signal.SIGCONT)
+    _tts_signal(signal.SIGKILL)
+
 try:
     from pyzbar.pyzbar import decode
 
@@ -55,7 +85,7 @@ class TextDialog(Gtk.Dialog):
         super().__init__(title="Extracting text…", application=app, modal=True)
         self.app = app
 
-        self.set_default_size(500, 400)
+        self.set_default_size(600, 450)
         self.toast_overlay = Adw.ToastOverlay()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_start(0)
@@ -105,15 +135,21 @@ class TextDialog(Gtk.Dialog):
         self.btn_copytoclipboard = Gtk.Button(label="Copy to Clipboard")
         self.btn_copytoclipboard.set_hexpand(True)
         self.btn_copytoclipboard.set_sensitive(False)
+        self.btn_speak = Gtk.Button(label="Speak")
+        self.btn_speak.set_hexpand(True)
+        self.btn_speak.set_sensitive(False)
+        self.speak_state = "idle"
         self.btn_retake_screenshot = Gtk.Button(label="Retake Screenshot")
         self.btn_retake_screenshot.set_hexpand(True)
 
         self.btn_save_to_file.connect("clicked", self.on_save_clicked)
         self.btn_copytoclipboard.connect("clicked", self.on_copy_clicked)
+        self.btn_speak.connect("clicked", self.on_speak_clicked)
         self.btn_retake_screenshot.connect("clicked", self.on_take_another_clicked)
 
         button_box.append(self.btn_save_to_file)
         button_box.append(self.btn_copytoclipboard)
+        button_box.append(self.btn_speak)
         button_box.append(self.btn_retake_screenshot)
         box.append(button_box)
         self.present()
@@ -131,6 +167,7 @@ class TextDialog(Gtk.Dialog):
 
         self.btn_save_to_file.set_sensitive(True)
         self.btn_copytoclipboard.set_sensitive(True)
+        self.btn_speak.set_sensitive(True)
 
     def get_text(self):
         buffer = self.text_view.get_buffer()
@@ -142,7 +179,7 @@ class TextDialog(Gtk.Dialog):
         dialog = Gtk.FileDialog()
         dialog.set_title("Save Extracted Text")
         dialog.set_initial_name(
-            f"clipboard_{datetime.now().strftime('%H-%M_%y-%m')}.txt"
+            f"ocr_{datetime.now().strftime('%H-%M')}.txt"
         )
 
         if self.app.save_location:
@@ -200,7 +237,46 @@ class TextDialog(Gtk.Dialog):
 
     def on_take_another_clicked(self, button):
         self.destroy()
-        GLib.timeout_add(150, self.app.take_screenshot)
+        # Long enough for GNOME's window animations to finish
+        GLib.timeout_add(600, self.app.take_screenshot)
+
+    def on_speak_clicked(self, button):
+        if self.speak_state == "idle":
+            text = self.get_text().strip()
+            if not text:
+                return
+            self.speak_state = "playing"
+            self.btn_speak.set_label("Pause")
+            threading.Thread(
+                target=self._speak_thread, args=(text,), daemon=True
+            ).start()
+        elif self.speak_state == "playing":
+            _tts_signal(signal.SIGSTOP)
+            self.speak_state = "paused"
+            self.btn_speak.set_label("Resume")
+        elif self.speak_state == "paused":
+            _tts_signal(signal.SIGCONT)
+            self.speak_state = "playing"
+            self.btn_speak.set_label("Pause")
+
+    def _speak_thread(self, text):
+        subprocess.run(["spd-say", "-C"], capture_output=True)
+        # "--" so text starting with "-" is not read as an option
+        subprocess.run(["spd-say", "--", text], capture_output=True)
+
+        deadline = time.monotonic() + TTS_START_TIMEOUT
+        while not _tts_running() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        # Paused speech keeps the job alive, so this also waits through a pause
+        while _tts_running():
+            time.sleep(0.3)
+
+        GLib.idle_add(self._reset_speak_button)
+
+    def _reset_speak_button(self):
+        self.speak_state = "idle"
+        self.btn_speak.set_label("Speak")
+        return False
 
 
 class GnomeOCRApp(Adw.Application):
@@ -355,6 +431,7 @@ class GnomeOCRApp(Adw.Application):
 
     def on_dialog_close(self, dialog):
         logger.info(f"Text from dialog: {dialog.get_text()}")
+        stop_speech()
         dialog.destroy()
         self.quit()
 
